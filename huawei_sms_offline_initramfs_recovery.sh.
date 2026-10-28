@@ -1,9 +1,4 @@
-
 #!/usr/bin/env bash
-# Huawei SMS offline Dracut recovery v2 — BIOS and UEFI (conventional GRUB).
-# Run ONLY on a healthy Huawei recovery ECS, with the failed system disk attached
-# as a DATA disk. Never run on the Azure source or on a functioning target.
-# This is a tested-manually-derived recovery workflow, NOT a universal boot fix.
 set -Eeuo pipefail
 
 usage() {
@@ -109,7 +104,6 @@ DISK=$(resolve "$DISK")
 [[ -z $BOOT ]] || BOOT=$(resolve "$BOOT")
 [[ -z $ESP ]] || ESP=$(resolve "$ESP")
 
-# Protect the recovery ECS's active root disk.
 LIVE_MM=$(findmnt -nro MAJ:MIN /)
 
 while IFS= read -r mm; do
@@ -117,7 +111,6 @@ while IFS= read -r mm; do
     fail 'Selected disk contains the recovery ECS live root!'
 done < <(lsblk -nr -o MAJ:MIN "$DISK")
 
-# Refuse disks that already contain mounted filesystems.
 if [[ -n $(lsblk -nr -o MOUNTPOINTS "$DISK" | grep -v '^$' || :) ]]; then
   lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS "$DISK"
   fail 'The selected disk already has mounted filesystems.'
@@ -175,7 +168,6 @@ mount_ext4() {
   fi
 }
 
-# Identify the migrated root partition using read-only inspection.
 if [[ -z $ROOT ]]; then
   log 'Looking for migrated root filesystem (read-only)'
   choices=()
@@ -193,7 +185,7 @@ if [[ -z $ROOT ]]; then
         fail 'Could not unmount a scan candidate.'
     fi
   done < <(
-    lsblk -nrlpo NAME,TYPE "$DISK" |
+    lsblk -nrpo NAME,TYPE "$DISK" |
       awk '$2=="part" {print $1}'
   )
 
@@ -259,7 +251,7 @@ find_partition_for_spec() {
       continue
     part_matches "$spec" "$p" && found+=("$p")
   done < <(
-    lsblk -nrlpo NAME,TYPE "$DISK" |
+    lsblk -nrpo NAME,TYPE "$DISK" |
       awk '$2=="part" {print $1}'
   )
 
@@ -301,8 +293,6 @@ else
     fail 'Missing integrated /boot.'
 fi
 
-# Detect common BIOS and UEFI GPT partition types.
-# Do not assume that an ESP alone proves UEFI boot.
 ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
 BIOS_GUID=21686148-6449-6e6f-744e-656564454649
 
@@ -316,7 +306,7 @@ while IFS= read -r p; do
   [[ $guid == "$ESP_GUID" ]] && HAS_ESP=1
   [[ $guid == "$BIOS_GUID" ]] && HAS_BIOS=1
 done < <(
-  lsblk -nrlpo NAME,TYPE "$DISK" |
+  lsblk -nrpo NAME,TYPE "$DISK" |
     awk '$2=="part" {print $1}'
 )
 
@@ -334,7 +324,6 @@ fi
 
 ESP_MOUNT=''
 
-# Validate the conventional UEFI layout.
 if [[ $FW == uefi ]]; then
   [[ -n $ESP ]] || {
     ESP_MOUNT=/boot/efi
@@ -378,7 +367,6 @@ if [[ $FW == uefi ]]; then
   fi
 fi
 
-# Inspect GRUB configuration.
 CFG=''
 
 for c in \
@@ -391,7 +379,6 @@ done
 [[ -n $CFG ]] ||
   fail 'No conventional GRUB configuration found; cannot safely rebuild for unknown bootloader.'
 
-# Identify kernel version.
 if [[ -z $KERNEL ]]; then
   shopt -s nullglob
   kernels=("$FS_MNT"/boot/vmlinuz-*)
@@ -454,7 +441,6 @@ if (( !APPLY )); then
   exit 0
 fi
 
-# Require manual confirmation before modifying the migrated disk.
 log 'Destructive-change guard'
 
 echo 'Confirm: SMS and any incremental sync have FINISHED; target ECS is STOPPED;'
@@ -493,7 +479,6 @@ cp -a "$IMG" "$BACKUP"
 
 log "Original initramfs preserved: $BACKUP"
 
-# Prepare the migrated OS chroot.
 for d in dev proc sys run; do
   [[ -d "$FS_MNT/$d" ]] ||
     fail "Missing /$d in migrated filesystem"
@@ -509,7 +494,6 @@ mount --make-rslave "$FS_MNT/sys"
 
 mount --bind /run "$FS_MNT/run"
 
-# Rebuild the migrated OS boot image.
 log 'Building portable Dracut initramfs inside migrated installation'
 
 chroot "$FS_MNT" /usr/bin/dracut \
@@ -530,7 +514,6 @@ grep -Eq '^[[:space:]]*rootfs-block[[:space:]]*$' \
   <<< "$MODULES" ||
   fail 'Dracut output missing rootfs-block module. Original remains intact.'
 
-# Check for unexpected embedded root filesystem references.
 CMD_ROOTS=$(
   lsinitrd "$CANDIDATE" |
     grep -Eo 'root=(UUID|PARTUUID)=[A-Za-z0-9-]+' || :
@@ -545,7 +528,6 @@ if [[ -n $CMD_ROOTS ]]; then
   done <<< "$CMD_ROOTS"
 fi
 
-# Preserve original image and atomically replace the active initramfs.
 cp -a "$CANDIDATE" "$IMG.new.$TS"
 mv -f "$IMG.new.$TS" "$IMG"
 
