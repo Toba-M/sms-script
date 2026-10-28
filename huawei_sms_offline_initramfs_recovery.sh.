@@ -1,65 +1,69 @@
 
 #!/usr/bin/env bash
-# Huawei SMS offline initramfs recovery
-# Run on a WORKING Huawei ECS with the failed migrated system disk
-# attached as a DATA disk.
-# Does not modify the Azure source or recovery ECS boot image.
-
+# Huawei SMS offline Dracut recovery v2 — BIOS and UEFI (conventional GRUB).
+# Run ONLY on a healthy Huawei recovery ECS, with the failed system disk attached
+# as a DATA disk. Never run on the Azure source or on a functioning target.
+# This is a tested-manually-derived recovery workflow, NOT a universal boot fix.
 set -Eeuo pipefail
 
 usage() {
-cat <<'HELP'
-Huawei SMS Offline Initramfs Recovery
+  cat <<'HELP'
+Huawei SMS offline initramfs recovery v2 (BIOS + conventional UEFI/GRUB)
 
-Usage:
-  sudo bash huawei_sms_offline_initramfs_recovery.sh \
-    --disk /dev/vdb \
-    --root-part /dev/vdb1 \
-    --boot-part /dev/vdb2 \
-    [--kernel VERSION] [--apply]
+  sudo bash huawei_sms_offline_initramfs_recovery.sh --disk /dev/vdb
+  sudo bash huawei_sms_offline_initramfs_recovery.sh --disk /dev/vdb --firmware uefi
+  sudo bash huawei_sms_offline_initramfs_recovery.sh --disk /dev/vdb --firmware uefi --apply
 
-Without --apply: read-only inspection.
-With --apply: rebuild migrated initramfs after confirmation.
+Optional: --root-part DEVICE --boot-part DEVICE --efi-part DEVICE
+          --kernel VERSION --firmware auto|bios|uefi --apply
 
-Before applying:
-- SMS migration/synchronization must not be running.
-- Failed target ECS must be stopped.
-- Create a snapshot of the migrated disk.
-- Attach that disk to a working Huawei ECS as a data disk.
-- Never initialize or format the migrated disk.
+Default: read-only inspection (no migrated-disk writes).
+--apply: rebuild the detached OS initramfs with a backup and confirmation.
+
+Supported: unencrypted GPT/MBR, ext4 root, ext4 /boot (separate or within root),
+conventional GRUB + Dracut; optional FAT32 EFI System Partition for UEFI.
+Unsupported layouts fail closed: LUKS, LVM root, XFS/Btrfs, UKI-only boots,
+missing or uncertain boot references, multiple kernels without --kernel.
+
+Before --apply: finish SMS and any incremental sync, stop the failed target,
+snapshot the affected EVS disk, and attach it as a DATA disk to the recovery ECS.
+This tool never formats a disk, reinstalls GRUB, or modifies the Azure source.
 HELP
 }
 
 fail() {
-  echo "ERROR: $*" >&2
+  printf 'ERROR: %s\n' "$*" >&2
   exit 1
 }
 
-note() {
-  echo
-  echo "==> $*"
+log() {
+  printf '\n==> %s\n' "$*"
 }
 
 need() {
   command -v "$1" >/dev/null 2>&1 ||
-    fail "Missing required command: $1"
+    fail "Missing command: $1"
 }
 
-DISK=""
-ROOT_PART=""
-BOOT_PART=""
-KERNEL=""
+DISK=''
+ROOT=''
+BOOT=''
+ESP=''
+KERNEL=''
+FW=auto
 APPLY=0
 
 while (($#)); do
   case "$1" in
-    --disk|--root-part|--boot-part|--kernel)
+    --disk|--root-part|--boot-part|--efi-part|--kernel|--firmware)
       (($# >= 2)) || fail "Missing value for $1"
       case "$1" in
-        --disk) DISK="$2" ;;
-        --root-part) ROOT_PART="$2" ;;
-        --boot-part) BOOT_PART="$2" ;;
-        --kernel) KERNEL="$2" ;;
+        --disk) DISK=$2 ;;
+        --root-part) ROOT=$2 ;;
+        --boot-part) BOOT=$2 ;;
+        --efi-part) ESP=$2 ;;
+        --kernel) KERNEL=$2 ;;
+        --firmware) FW=$2 ;;
       esac
       shift 2
       ;;
@@ -72,103 +76,85 @@ while (($#)); do
       exit 0
       ;;
     *)
-      fail "Unknown argument: $1"
+      fail "Unknown option: $1"
       ;;
   esac
 done
 
-[[ $EUID -eq 0 ]] || fail "Run as root using sudo."
+[[ $EUID == 0 ]] || fail 'Run with sudo/root.'
+[[ -n $DISK ]] || {
+  usage
+  fail 'Specify --disk explicitly.'
+}
 
-[[ -n $DISK && -n $ROOT_PART && -n $BOOT_PART ]] ||
-  fail "Specify --disk, --root-part and --boot-part."
+[[ $FW == auto || $FW == bios || $FW == uefi ]] ||
+  fail 'Invalid --firmware value.'
 
-for cmd in lsblk blkid findmnt mount umount stat awk grep \
-           readlink mktemp df chroot cp mv sync lsinitrd; do
-  need "$cmd"
+for c in lsblk blkid findmnt mount umount readlink mktemp awk grep chroot \
+         cp mv sync lsinitrd stat df head date file find; do
+  need "$c"
 done
 
-# Resolve devices to actual block-device paths.
-for var in DISK ROOT_PART BOOT_PART; do
-  value="${!var}"
-  [[ -b "$value" ]] || fail "Not a block device: $value"
+resolve() {
+  [[ -b $1 ]] || fail "Not a block device: $1"
+  readlink -f -- "$1"
+}
 
-  canonical="$(readlink -f -- "$value")"
-  [[ -b "$canonical" ]] || fail "Cannot resolve: $value"
-
-  printf -v "$var" '%s' "$canonical"
-done
-
-[[ $DISK != "$ROOT_PART" &&
-   $DISK != "$BOOT_PART" &&
-   $ROOT_PART != "$BOOT_PART" ]] ||
-  fail "Disk and partition paths must be different."
+DISK=$(resolve "$DISK")
 
 [[ $(lsblk -dnro TYPE "$DISK") == disk ]] ||
-  fail "Selected device is not a disk."
+  fail 'Select a whole disk, not a partition.'
 
-[[ $(lsblk -dnro TYPE "$ROOT_PART") == part ]] ||
-  fail "Root is not a partition."
+[[ -z $ROOT ]] || ROOT=$(resolve "$ROOT")
+[[ -z $BOOT ]] || BOOT=$(resolve "$BOOT")
+[[ -z $ESP ]] || ESP=$(resolve "$ESP")
 
-[[ $(lsblk -dnro TYPE "$BOOT_PART") == part ]] ||
-  fail "Boot is not a partition."
-
-# Confirm both partitions belong to the selected disk.
-parent_root="$(readlink -f "/dev/$(lsblk -dnro PKNAME "$ROOT_PART")")"
-parent_boot="$(readlink -f "/dev/$(lsblk -dnro PKNAME "$BOOT_PART")")"
-
-[[ $parent_root == "$DISK" &&
-   $parent_boot == "$DISK" ]] ||
-  fail "Partitions do not belong to the selected disk."
-
-# Critical protection: reject the recovery ECS's own root disk.
-live_root_mm="$(findmnt -nro MAJ:MIN /)"
+# Protect the recovery ECS's active root disk.
+LIVE_MM=$(findmnt -nro MAJ:MIN /)
 
 while IFS= read -r mm; do
-  [[ "$mm" != "$live_root_mm" ]] ||
-    fail "STOP: selected disk contains the LIVE recovery ECS root!"
+  [[ "$mm" != "$LIVE_MM" ]] ||
+    fail 'Selected disk contains the recovery ECS live root!'
 done < <(lsblk -nr -o MAJ:MIN "$DISK")
 
-# Refuse a disk containing mounted partitions.
-if [[ -n $(lsblk -nr -o MOUNTPOINTS "$DISK" |
-            grep -v '^$' || true) ]]; then
+# Refuse disks that already contain mounted filesystems.
+if [[ -n $(lsblk -nr -o MOUNTPOINTS "$DISK" | grep -v '^$' || :) ]]; then
   lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS "$DISK"
-  fail "Selected disk has mounted partitions."
+  fail 'The selected disk already has mounted filesystems.'
 fi
 
-[[ $(blkid -s TYPE -o value "$ROOT_PART") == ext4 ]] ||
-  fail "Root partition must be ext4."
+is_child() {
+  local p=$1 parent
+  [[ $(lsblk -dnro TYPE "$p") == part ]] || return 1
+  parent=$(lsblk -dnro PKNAME "$p")
+  [[ -n $parent ]] &&
+    [[ $(readlink -f "/dev/$parent") == "$DISK" ]]
+}
 
-[[ $(blkid -s TYPE -o value "$BOOT_PART") == ext4 ]] ||
-  fail "Boot partition must be ext4."
+for p in "$ROOT" "$BOOT" "$ESP"; do
+  [[ -z $p ]] || is_child "$p" ||
+    fail "$p is not a direct partition of $DISK"
+done
 
-ROOT_UUID="$(blkid -s UUID -o value "$ROOT_PART")"
-[[ -n $ROOT_UUID ]] || fail "Root UUID not found."
-
-note "Selected migrated disk"
-lsblk -o NAME,PATH,SIZE,FSTYPE,UUID,MOUNTPOINTS "$DISK"
-
-echo "Migrated root UUID: $ROOT_UUID"
-echo "Recovery ECS root: $(findmnt -nro SOURCE /)"
-
-MNT="$(mktemp -d /mnt/huawei-sms-recovery.XXXXXXXX)"
-MOUNTED=0
+FS_MNT=$(mktemp -d /mnt/sms-recovery-v2.XXXXXXXX)
+ROOT_MOUNTED=0
 
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
 
-  if ((MOUNTED)); then
-    sync || true
+  if ((ROOT_MOUNTED)); then
+    sync || :
 
-    if ! umount -R -- "$MNT"; then
-      echo "WARNING: Failed to unmount $MNT" >&2
-      echo "DO NOT detach the disk yet." >&2
-      lsblk -o NAME,SIZE,MOUNTPOINTS "$DISK" >&2 || true
+    if ! umount -R "$FS_MNT"; then
+      printf 'UNMOUNT FAILED! DO NOT DETACH THE DISK. Check: findmnt -R %s\n' \
+        "$FS_MNT" >&2
+      lsblk -o NAME,SIZE,MOUNTPOINTS "$DISK" >&2 || :
       exit 1
     fi
   fi
 
-  rmdir "$MNT" 2>/dev/null || true
+  rmdir "$FS_MNT" 2>/dev/null || :
   exit "$rc"
 }
 
@@ -176,164 +162,399 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-note "Mounting migrated partitions read-only"
+mount_ext4() {
+  local dev=$1 loc=$2 mode=$3
 
-mount -t ext4 -o ro,noload "$ROOT_PART" "$MNT"
-MOUNTED=1
+  [[ $(blkid -s TYPE -o value "$dev") == ext4 ]] ||
+    fail "$dev is not ext4"
 
-[[ -d "$MNT/boot" ]] ||
-  fail "Migrated root has no /boot directory."
+  if [[ $mode == ro ]]; then
+    mount -t ext4 -o ro,noload "$dev" "$loc"
+  else
+    mount -t ext4 -o rw "$dev" "$loc"
+  fi
+}
 
-mount -t ext4 -o ro,noload "$BOOT_PART" "$MNT/boot"
+# Identify the migrated root partition using read-only inspection.
+if [[ -z $ROOT ]]; then
+  log 'Looking for migrated root filesystem (read-only)'
+  choices=()
 
-[[ -f "$MNT/etc/fstab" ]] ||
-  fail "Migrated /etc/fstab not found."
+  while IFS= read -r p; do
+    [[ $(blkid -s TYPE -o value "$p" 2>/dev/null || :) == ext4 ]] ||
+      continue
 
-FSTAB_ROOT="$(
-  awk '$1 !~ /^#/ && $2 == "/" {print $1}' \
-    "$MNT/etc/fstab" | head -n 1
-)"
+    if mount -t ext4 -o ro,noload "$p" "$FS_MNT" 2>/dev/null; then
+      if [[ -f "$FS_MNT/etc/fstab" &&
+            -f "$FS_MNT/etc/os-release" ]]; then
+        choices+=("$p")
+      fi
+      umount "$FS_MNT" ||
+        fail 'Could not unmount a scan candidate.'
+    fi
+  done < <(
+    lsblk -nrlpo NAME,TYPE "$DISK" |
+      awk '$2=="part" {print $1}'
+  )
 
-[[ $FSTAB_ROOT == "UUID=$ROOT_UUID" ]] ||
-  fail "fstab root UUID does not match the disk UUID."
+  ((${#choices[@]} == 1)) ||
+    fail "Found ${#choices[@]} root candidates; pass --root-part explicitly."
 
-echo "fstab root UUID verified."
-
-# Discover migrated kernel if not explicitly provided.
-if [[ -z $KERNEL ]]; then
-  shopt -s nullglob
-  kernels=("$MNT"/boot/vmlinuz-*)
-  shopt -u nullglob
-
-  ((${#kernels[@]} == 1)) ||
-    fail "Multiple or missing kernels; specify --kernel."
-
-  KERNEL="${kernels[0]##*/vmlinuz-}"
+  ROOT=${choices[0]}
 fi
 
-[[ $KERNEL =~ ^[A-Za-z0-9._+-]+$ ]] ||
-  fail "Invalid kernel version."
+[[ -z $BOOT || $ROOT != "$BOOT" ]] ||
+  fail 'Do not pass root as --boot-part; omit --boot-part for integrated /boot.'
 
-[[ -f "$MNT/boot/vmlinuz-$KERNEL" ]] ||
-  fail "Kernel image missing."
+[[ -z $ESP || ($ESP != "$ROOT" && $ESP != "$BOOT") ]] ||
+  fail 'EFI partition overlaps other partitions.'
 
-[[ -f "$MNT/boot/initrd.img-$KERNEL" ]] ||
-  fail "Original initramfs missing."
+mount_ext4 "$ROOT" "$FS_MNT" ro
+ROOT_MOUNTED=1
 
-[[ -d "$MNT/usr/lib/modules/$KERNEL" ]] ||
-  fail "Kernel modules missing."
+[[ -f "$FS_MNT/etc/fstab" &&
+   -f "$FS_MNT/etc/os-release" ]] ||
+  fail 'Selected root is not a recognized Linux installation.'
 
-[[ -x "$MNT/usr/bin/dracut" ]] ||
-  fail "Dracut missing in migrated OS."
+fstab_spec() {
+  awk -v target="$1" \
+    '$1 !~ /^#/ && $2==target {print $1; exit}' \
+    "$FS_MNT/etc/fstab"
+}
 
-[[ -x "$MNT/bin/sh" || -x "$MNT/usr/bin/sh" ]] ||
-  fail "Migrated shell missing."
+part_matches() {
+  local spec=$1 p=$2 key expect
 
-echo "Kernel: $KERNEL"
+  case $spec in
+    UUID=*)
+      key=UUID
+      expect=${spec#UUID=}
+      ;;
+    PARTUUID=*)
+      key=PARTUUID
+      expect=${spec#PARTUUID=}
+      ;;
+    LABEL=*)
+      key=LABEL
+      expect=${spec#LABEL=}
+      ;;
+    PARTLABEL=*)
+      key=PARTLABEL
+      expect=${spec#PARTLABEL=}
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 
-if [[ -f "$MNT/boot/grub/grub.cfg" ]]; then
-  if grep -Fq "$ROOT_UUID" "$MNT/boot/grub/grub.cfg"; then
-    echo "GRUB root UUID verified."
+  [[ $(blkid -s "$key" -o value "$p" 2>/dev/null || :) == "$expect" ]]
+}
+
+find_partition_for_spec() {
+  local spec=$1 type=${2:-ext4} p
+  local found=()
+
+  while IFS= read -r p; do
+    [[ $(blkid -s TYPE -o value "$p" 2>/dev/null || :) == "$type" ]] ||
+      continue
+    part_matches "$spec" "$p" && found+=("$p")
+  done < <(
+    lsblk -nrlpo NAME,TYPE "$DISK" |
+      awk '$2=="part" {print $1}'
+  )
+
+  ((${#found[@]} == 1)) ||
+    fail "Cannot uniquely resolve fstab '$spec' ($type) on $DISK."
+
+  printf '%s\n' "${found[0]}"
+}
+
+ROOT_SPEC=$(fstab_spec /)
+
+[[ -n $ROOT_SPEC ]] ||
+  fail 'No / entry in migrated fstab.'
+
+part_matches "$ROOT_SPEC" "$ROOT" ||
+  fail 'fstab root does not match selected root partition.'
+
+BOOT_SPEC=$(fstab_spec /boot)
+
+if [[ -n $BOOT_SPEC ]]; then
+  [[ -n $BOOT ]] ||
+    BOOT=$(find_partition_for_spec "$BOOT_SPEC" ext4)
+
+  is_child "$BOOT" ||
+    fail 'Boot is not a partition of selected disk.'
+
+  part_matches "$BOOT_SPEC" "$BOOT" ||
+    fail 'fstab /boot does not match selected boot partition.'
+
+  [[ -d $FS_MNT/boot ]] ||
+    fail 'Missing /boot mount directory.'
+
+  mount_ext4 "$BOOT" "$FS_MNT/boot" ro
+else
+  [[ -z $BOOT ]] ||
+    fail 'No separate /boot in fstab. Omit --boot-part.'
+
+  [[ -d $FS_MNT/boot ]] ||
+    fail 'Missing integrated /boot.'
+fi
+
+# Detect common BIOS and UEFI GPT partition types.
+# Do not assume that an ESP alone proves UEFI boot.
+ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+BIOS_GUID=21686148-6449-6e6f-744e-656564454649
+
+HAS_ESP=0
+HAS_BIOS=0
+
+while IFS= read -r p; do
+  guid=$(blkid -s PART_ENTRY_TYPE -o value "$p" 2>/dev/null || :)
+  guid=${guid,,}
+
+  [[ $guid == "$ESP_GUID" ]] && HAS_ESP=1
+  [[ $guid == "$BIOS_GUID" ]] && HAS_BIOS=1
+done < <(
+  lsblk -nrlpo NAME,TYPE "$DISK" |
+    awk '$2=="part" {print $1}'
+)
+
+if [[ $FW == auto ]]; then
+  if (( HAS_ESP && HAS_BIOS )); then
+    fail 'Both ESP and BIOS boot partitions exist. Specify --firmware bios or --firmware uefi after checking the original target firmware.'
+  elif (( HAS_ESP )); then
+    FW=uefi
+  elif (( HAS_BIOS )); then
+    FW=bios
   else
-    echo "WARNING: GRUB root UUID not verified."
-    ((APPLY == 0)) ||
-      fail "Fix GRUB separately before applying."
+    fail 'Cannot infer firmware safely. Specify --firmware bios or --firmware uefi.'
   fi
 fi
 
-if (( ! APPLY )); then
-  note "Read-only inspection completed."
-  echo "No migrated files were modified."
-  echo "After creating a snapshot, rerun with --apply."
+ESP_MOUNT=''
+
+# Validate the conventional UEFI layout.
+if [[ $FW == uefi ]]; then
+  [[ -n $ESP ]] || {
+    ESP_MOUNT=/boot/efi
+    EFI_SPEC=$(fstab_spec /boot/efi)
+
+    if [[ -z $EFI_SPEC ]]; then
+      ESP_MOUNT=/efi
+      EFI_SPEC=$(fstab_spec /efi)
+    fi
+
+    [[ -n $EFI_SPEC ]] ||
+      fail 'UEFI selected, but no /boot/efi or /efi fstab entry. Unsupported layout.'
+
+    ESP=$(find_partition_for_spec "$EFI_SPEC" vfat)
+  }
+
+  is_child "$ESP" ||
+    fail 'EFI partition does not belong to selected disk.'
+
+  [[ $(blkid -s TYPE -o value "$ESP") == vfat ]] ||
+    fail 'EFI partition must be FAT32/vfat.'
+
+  if [[ -z $ESP_MOUNT ]]; then
+    ESP_MOUNT=/boot/efi
+    [[ -z $(fstab_spec /efi) ]] ||
+      ESP_MOUNT=/efi
+  fi
+
+  [[ -d "$FS_MNT$ESP_MOUNT" ]] ||
+    fail "Missing EFI directory $ESP_MOUNT"
+
+  mount -t vfat -o ro,umask=0077 \
+    "$ESP" "$FS_MNT$ESP_MOUNT"
+
+  [[ -n $(find "$FS_MNT$ESP_MOUNT/EFI" \
+    -type f -iname '*.efi' -print -quit 2>/dev/null || :) ]] ||
+    fail 'EFI System Partition contains no recognizable .efi loader.'
+
+  if [[ -d "$FS_MNT$ESP_MOUNT/EFI/Linux" ]]; then
+    echo 'NOTE: EFI/Linux may contain UKIs; confirm GRUB boots a separate initramfs.'
+  fi
+fi
+
+# Inspect GRUB configuration.
+CFG=''
+
+for c in \
+  "$FS_MNT/boot/grub/grub.cfg" \
+  "$FS_MNT/boot/grub2/grub.cfg"; do
+
+  [[ -f $c ]] && CFG=$c && break
+done
+
+[[ -n $CFG ]] ||
+  fail 'No conventional GRUB configuration found; cannot safely rebuild for unknown bootloader.'
+
+# Identify kernel version.
+if [[ -z $KERNEL ]]; then
+  shopt -s nullglob
+  kernels=("$FS_MNT"/boot/vmlinuz-*)
+  shopt -u nullglob
+
+  ((${#kernels[@]} == 1)) ||
+    fail "Found ${#kernels[@]} kernels; provide --kernel VERSION explicitly."
+
+  KERNEL=${kernels[0]##*/vmlinuz-}
+fi
+
+[[ $KERNEL =~ ^[a-zA-Z0-9._+-]+$ ]] ||
+  fail 'Invalid kernel version.'
+
+[[ -f "$FS_MNT/boot/vmlinuz-$KERNEL" ]] ||
+  fail 'Kernel file missing.'
+
+[[ -s "$FS_MNT/boot/initrd.img-$KERNEL" ]] ||
+  fail 'Conventional initramfs missing; UKI-only boot unsupported.'
+
+[[ -d "$FS_MNT/usr/lib/modules/$KERNEL" ]] ||
+  fail 'Kernel modules missing.'
+
+[[ -x "$FS_MNT/usr/bin/dracut" ]] ||
+  fail 'Dracut not installed in migrated root.'
+
+[[ -x "$FS_MNT/bin/sh" ||
+   -x "$FS_MNT/usr/bin/sh" ]] ||
+  fail 'Migrated shell unavailable.'
+
+grep -Fq "$KERNEL" "$CFG" ||
+  fail 'GRUB configuration does not reference selected kernel.'
+
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT")
+ROOT_PARTUUID=$(blkid -s PARTUUID -o value "$ROOT" || :)
+
+if ! grep -Eq \
+  "root=UUID=${ROOT_UUID}([[:space:]\"']|$)|root=PARTUUID=${ROOT_PARTUUID}([[:space:]\"']|$)" \
+  "$CFG"; then
+
+  fail 'GRUB does not clearly reference migrated root UUID/PARTUUID. Inspect GRUB before any rebuild.'
+fi
+
+log 'Inspection summary'
+
+lsblk -o NAME,SIZE,FSTYPE,UUID,PARTUUID,MOUNTPOINTS "$DISK"
+
+printf 'Firmware: %s\nRoot: %s (%s)\n/boot: %s\nEFI: %s\nKernel: %s\nGRUB: %s\n' \
+  "$FW" \
+  "$ROOT" \
+  "$ROOT_SPEC" \
+  "${BOOT:-inside root}" \
+  "${ESP:-not used}" \
+  "$KERNEL" \
+  "${CFG#"$FS_MNT"}"
+
+if (( !APPLY )); then
+  log 'PASS: read-only inspection complete; migrated boot files unchanged.'
+  echo 'When ready, rerun with --apply and the SAME --disk and --firmware values.'
   exit 0
 fi
 
-note "Final safety confirmation"
+# Require manual confirmation before modifying the migrated disk.
+log 'Destructive-change guard'
 
-echo "Azure source VM will not be modified."
-echo "Recovery ECS boot image will not be modified."
-echo "Only the attached migrated disk will be changed."
-echo
-echo "Selected disk: $DISK"
-echo "Root: $ROOT_PART"
-echo "Boot: $BOOT_PART"
-echo "Kernel: $KERNEL"
-echo
-echo "Confirm SMS is finished and an EVS snapshot exists."
-printf 'Type %s to authorize: ' "$DISK"
+echo 'Confirm: SMS and any incremental sync have FINISHED; target ECS is STOPPED;'
+echo 'and an AVAILABLE EVS snapshot of this migrated disk has been verified.'
+echo 'Only this OFFLINE migrated disk will be modified, never the recovery ECS boot disk.'
 
+printf 'Type exact disk path %s to continue: ' "$DISK"
 read -r ANSWER
+
 [[ $ANSWER == "$DISK" ]] ||
-  fail "Confirmation failed."
+  fail 'Confirmation did not match.'
 
-note "Remounting migrated disk read-write"
+log 'Remounting target root and boot read-write'
 
-umount "$MNT/boot"
-umount "$MNT"
-MOUNTED=0
+umount -R "$FS_MNT"
+ROOT_MOUNTED=0
 
-mount -t ext4 -o rw "$ROOT_PART" "$MNT"
-MOUNTED=1
-mount -t ext4 -o rw "$BOOT_PART" "$MNT/boot"
+mount_ext4 "$ROOT" "$FS_MNT" rw
+ROOT_MOUNTED=1
 
-IMG="$MNT/boot/initrd.img-$KERNEL"
-TS="$(date -u +%Y%m%dT%H%M%SZ)"
+[[ -z $BOOT ]] ||
+  mount_ext4 "$BOOT" "$FS_MNT/boot" rw
+
+[[ $FW != uefi ]] ||
+  mount -t vfat -o ro,umask=0077 \
+    "$ESP" "$FS_MNT$ESP_MOUNT"
+
+IMG="$FS_MNT/boot/initrd.img-$KERNEL"
+
+TS=$(date -u +%Y%m%dT%H%M%SZ)
 
 BACKUP="$IMG.sms-original.$TS"
 CANDIDATE="$IMG.rebuilt.$TS"
 
-note "Backing up original initramfs"
-
 cp -a "$IMG" "$BACKUP"
-echo "Backup: $BACKUP"
 
-note "Preparing migrated OS recovery environment"
+log "Original initramfs preserved: $BACKUP"
 
-mount --rbind /dev "$MNT/dev"
-mount --make-rslave "$MNT/dev"
+# Prepare the migrated OS chroot.
+for d in dev proc sys run; do
+  [[ -d "$FS_MNT/$d" ]] ||
+    fail "Missing /$d in migrated filesystem"
+done
 
-mount -t proc proc "$MNT/proc"
+mount --rbind /dev "$FS_MNT/dev"
+mount --make-rslave "$FS_MNT/dev"
 
-mount --rbind /sys "$MNT/sys"
-mount --make-rslave "$MNT/sys"
+mount -t proc proc "$FS_MNT/proc"
 
-mount --bind /run "$MNT/run"
+mount --rbind /sys "$FS_MNT/sys"
+mount --make-rslave "$FS_MNT/sys"
 
-note "Rebuilding migrated initramfs"
+mount --bind /run "$FS_MNT/run"
 
-chroot "$MNT" /usr/bin/dracut \
+# Rebuild the migrated OS boot image.
+log 'Building portable Dracut initramfs inside migrated installation'
+
+chroot "$FS_MNT" /usr/bin/dracut \
   --fstab \
   --no-hostonly \
   --no-hostonly-cmdline \
   "/boot/$(basename "$CANDIDATE")" \
   "$KERNEL"
 
-[[ -s "$CANDIDATE" ]] ||
-  fail "New initramfs was not generated."
+[[ -s $CANDIDATE ]] ||
+  fail 'Dracut output is empty or missing.'
 
-note "Validating rebuilt initramfs"
-
-need file
 file "$CANDIDATE"
 
-lsinitrd -m "$CANDIDATE" |
-  grep '^rootfs-block$' >/dev/null ||
-  fail "Required rootfs-block module missing."
+MODULES=$(lsinitrd -m "$CANDIDATE")
 
-note "Activating rebuilt initramfs"
+grep -Eq '^[[:space:]]*rootfs-block[[:space:]]*$' \
+  <<< "$MODULES" ||
+  fail 'Dracut output missing rootfs-block module. Original remains intact.'
 
+# Check for unexpected embedded root filesystem references.
+CMD_ROOTS=$(
+  lsinitrd "$CANDIDATE" |
+    grep -Eo 'root=(UUID|PARTUUID)=[A-Za-z0-9-]+' || :
+)
+
+if [[ -n $CMD_ROOTS ]]; then
+  while IFS= read -r value; do
+    [[ $value == "root=UUID=$ROOT_UUID" ||
+       ( -n $ROOT_PARTUUID &&
+         $value == "root=PARTUUID=$ROOT_PARTUUID" ) ]] ||
+      fail "Unexpected embedded root reference: $value. Rebuilt image NOT activated."
+  done <<< "$CMD_ROOTS"
+fi
+
+# Preserve original image and atomically replace the active initramfs.
 cp -a "$CANDIDATE" "$IMG.new.$TS"
 mv -f "$IMG.new.$TS" "$IMG"
 
 sync
 
-echo
-echo "Repair completed."
-echo "Updated: $IMG"
-echo "Original backup: $BACKUP"
-echo "Rebuilt image: $CANDIDATE"
-echo
-echo "The script will now unmount the recovery disk."
-echo "Verify all partitions are unmounted before EVS detachment."
-echo "Then reattach the disk to its original ECS as system disk."
+log 'Rebuild installed successfully'
 
+printf 'Backup: %s\nNew image: %s\n' "$BACKUP" "$IMG"
+
+echo 'Cleanup will unmount all temporary recovery mounts.'
+echo 'Verify with lsblk BEFORE detaching the disk in Huawei EVS.'
+echo 'This does not repair Secure Boot, GRUB/EFI loaders, LUKS, LVM, or UKI-only boot.'
