@@ -1,1 +1,339 @@
 
+#!/usr/bin/env bash
+# Huawei SMS offline initramfs recovery
+# Run on a WORKING Huawei ECS with the failed migrated system disk
+# attached as a DATA disk.
+# Does not modify the Azure source or recovery ECS boot image.
+
+set -Eeuo pipefail
+
+usage() {
+cat <<'HELP'
+Huawei SMS Offline Initramfs Recovery
+
+Usage:
+  sudo bash huawei_sms_offline_initramfs_recovery.sh \
+    --disk /dev/vdb \
+    --root-part /dev/vdb1 \
+    --boot-part /dev/vdb2 \
+    [--kernel VERSION] [--apply]
+
+Without --apply: read-only inspection.
+With --apply: rebuild migrated initramfs after confirmation.
+
+Before applying:
+- SMS migration/synchronization must not be running.
+- Failed target ECS must be stopped.
+- Create a snapshot of the migrated disk.
+- Attach that disk to a working Huawei ECS as a data disk.
+- Never initialize or format the migrated disk.
+HELP
+}
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+note() {
+  echo
+  echo "==> $*"
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 ||
+    fail "Missing required command: $1"
+}
+
+DISK=""
+ROOT_PART=""
+BOOT_PART=""
+KERNEL=""
+APPLY=0
+
+while (($#)); do
+  case "$1" in
+    --disk|--root-part|--boot-part|--kernel)
+      (($# >= 2)) || fail "Missing value for $1"
+      case "$1" in
+        --disk) DISK="$2" ;;
+        --root-part) ROOT_PART="$2" ;;
+        --boot-part) BOOT_PART="$2" ;;
+        --kernel) KERNEL="$2" ;;
+      esac
+      shift 2
+      ;;
+    --apply)
+      APPLY=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "Unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || fail "Run as root using sudo."
+
+[[ -n $DISK && -n $ROOT_PART && -n $BOOT_PART ]] ||
+  fail "Specify --disk, --root-part and --boot-part."
+
+for cmd in lsblk blkid findmnt mount umount stat awk grep \
+           readlink mktemp df chroot cp mv sync lsinitrd; do
+  need "$cmd"
+done
+
+# Resolve devices to actual block-device paths.
+for var in DISK ROOT_PART BOOT_PART; do
+  value="${!var}"
+  [[ -b "$value" ]] || fail "Not a block device: $value"
+
+  canonical="$(readlink -f -- "$value")"
+  [[ -b "$canonical" ]] || fail "Cannot resolve: $value"
+
+  printf -v "$var" '%s' "$canonical"
+done
+
+[[ $DISK != "$ROOT_PART" &&
+   $DISK != "$BOOT_PART" &&
+   $ROOT_PART != "$BOOT_PART" ]] ||
+  fail "Disk and partition paths must be different."
+
+[[ $(lsblk -dnro TYPE "$DISK") == disk ]] ||
+  fail "Selected device is not a disk."
+
+[[ $(lsblk -dnro TYPE "$ROOT_PART") == part ]] ||
+  fail "Root is not a partition."
+
+[[ $(lsblk -dnro TYPE "$BOOT_PART") == part ]] ||
+  fail "Boot is not a partition."
+
+# Confirm both partitions belong to the selected disk.
+parent_root="$(readlink -f "/dev/$(lsblk -dnro PKNAME "$ROOT_PART")")"
+parent_boot="$(readlink -f "/dev/$(lsblk -dnro PKNAME "$BOOT_PART")")"
+
+[[ $parent_root == "$DISK" &&
+   $parent_boot == "$DISK" ]] ||
+  fail "Partitions do not belong to the selected disk."
+
+# Critical protection: reject the recovery ECS's own root disk.
+live_root_mm="$(findmnt -nro MAJ:MIN /)"
+
+while IFS= read -r mm; do
+  [[ "$mm" != "$live_root_mm" ]] ||
+    fail "STOP: selected disk contains the LIVE recovery ECS root!"
+done < <(lsblk -nr -o MAJ:MIN "$DISK")
+
+# Refuse a disk containing mounted partitions.
+if [[ -n $(lsblk -nr -o MOUNTPOINTS "$DISK" |
+            grep -v '^$' || true) ]]; then
+  lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS "$DISK"
+  fail "Selected disk has mounted partitions."
+fi
+
+[[ $(blkid -s TYPE -o value "$ROOT_PART") == ext4 ]] ||
+  fail "Root partition must be ext4."
+
+[[ $(blkid -s TYPE -o value "$BOOT_PART") == ext4 ]] ||
+  fail "Boot partition must be ext4."
+
+ROOT_UUID="$(blkid -s UUID -o value "$ROOT_PART")"
+[[ -n $ROOT_UUID ]] || fail "Root UUID not found."
+
+note "Selected migrated disk"
+lsblk -o NAME,PATH,SIZE,FSTYPE,UUID,MOUNTPOINTS "$DISK"
+
+echo "Migrated root UUID: $ROOT_UUID"
+echo "Recovery ECS root: $(findmnt -nro SOURCE /)"
+
+MNT="$(mktemp -d /mnt/huawei-sms-recovery.XXXXXXXX)"
+MOUNTED=0
+
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+
+  if ((MOUNTED)); then
+    sync || true
+
+    if ! umount -R -- "$MNT"; then
+      echo "WARNING: Failed to unmount $MNT" >&2
+      echo "DO NOT detach the disk yet." >&2
+      lsblk -o NAME,SIZE,MOUNTPOINTS "$DISK" >&2 || true
+      exit 1
+    fi
+  fi
+
+  rmdir "$MNT" 2>/dev/null || true
+  exit "$rc"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+note "Mounting migrated partitions read-only"
+
+mount -t ext4 -o ro,noload "$ROOT_PART" "$MNT"
+MOUNTED=1
+
+[[ -d "$MNT/boot" ]] ||
+  fail "Migrated root has no /boot directory."
+
+mount -t ext4 -o ro,noload "$BOOT_PART" "$MNT/boot"
+
+[[ -f "$MNT/etc/fstab" ]] ||
+  fail "Migrated /etc/fstab not found."
+
+FSTAB_ROOT="$(
+  awk '$1 !~ /^#/ && $2 == "/" {print $1}' \
+    "$MNT/etc/fstab" | head -n 1
+)"
+
+[[ $FSTAB_ROOT == "UUID=$ROOT_UUID" ]] ||
+  fail "fstab root UUID does not match the disk UUID."
+
+echo "fstab root UUID verified."
+
+# Discover migrated kernel if not explicitly provided.
+if [[ -z $KERNEL ]]; then
+  shopt -s nullglob
+  kernels=("$MNT"/boot/vmlinuz-*)
+  shopt -u nullglob
+
+  ((${#kernels[@]} == 1)) ||
+    fail "Multiple or missing kernels; specify --kernel."
+
+  KERNEL="${kernels[0]##*/vmlinuz-}"
+fi
+
+[[ $KERNEL =~ ^[A-Za-z0-9._+-]+$ ]] ||
+  fail "Invalid kernel version."
+
+[[ -f "$MNT/boot/vmlinuz-$KERNEL" ]] ||
+  fail "Kernel image missing."
+
+[[ -f "$MNT/boot/initrd.img-$KERNEL" ]] ||
+  fail "Original initramfs missing."
+
+[[ -d "$MNT/usr/lib/modules/$KERNEL" ]] ||
+  fail "Kernel modules missing."
+
+[[ -x "$MNT/usr/bin/dracut" ]] ||
+  fail "Dracut missing in migrated OS."
+
+[[ -x "$MNT/bin/sh" || -x "$MNT/usr/bin/sh" ]] ||
+  fail "Migrated shell missing."
+
+echo "Kernel: $KERNEL"
+
+if [[ -f "$MNT/boot/grub/grub.cfg" ]]; then
+  if grep -Fq "$ROOT_UUID" "$MNT/boot/grub/grub.cfg"; then
+    echo "GRUB root UUID verified."
+  else
+    echo "WARNING: GRUB root UUID not verified."
+    ((APPLY == 0)) ||
+      fail "Fix GRUB separately before applying."
+  fi
+fi
+
+if (( ! APPLY )); then
+  note "Read-only inspection completed."
+  echo "No migrated files were modified."
+  echo "After creating a snapshot, rerun with --apply."
+  exit 0
+fi
+
+note "Final safety confirmation"
+
+echo "Azure source VM will not be modified."
+echo "Recovery ECS boot image will not be modified."
+echo "Only the attached migrated disk will be changed."
+echo
+echo "Selected disk: $DISK"
+echo "Root: $ROOT_PART"
+echo "Boot: $BOOT_PART"
+echo "Kernel: $KERNEL"
+echo
+echo "Confirm SMS is finished and an EVS snapshot exists."
+printf 'Type %s to authorize: ' "$DISK"
+
+read -r ANSWER
+[[ $ANSWER == "$DISK" ]] ||
+  fail "Confirmation failed."
+
+note "Remounting migrated disk read-write"
+
+umount "$MNT/boot"
+umount "$MNT"
+MOUNTED=0
+
+mount -t ext4 -o rw "$ROOT_PART" "$MNT"
+MOUNTED=1
+mount -t ext4 -o rw "$BOOT_PART" "$MNT/boot"
+
+IMG="$MNT/boot/initrd.img-$KERNEL"
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+
+BACKUP="$IMG.sms-original.$TS"
+CANDIDATE="$IMG.rebuilt.$TS"
+
+note "Backing up original initramfs"
+
+cp -a "$IMG" "$BACKUP"
+echo "Backup: $BACKUP"
+
+note "Preparing migrated OS recovery environment"
+
+mount --rbind /dev "$MNT/dev"
+mount --make-rslave "$MNT/dev"
+
+mount -t proc proc "$MNT/proc"
+
+mount --rbind /sys "$MNT/sys"
+mount --make-rslave "$MNT/sys"
+
+mount --bind /run "$MNT/run"
+
+note "Rebuilding migrated initramfs"
+
+chroot "$MNT" /usr/bin/dracut \
+  --fstab \
+  --no-hostonly \
+  --no-hostonly-cmdline \
+  "/boot/$(basename "$CANDIDATE")" \
+  "$KERNEL"
+
+[[ -s "$CANDIDATE" ]] ||
+  fail "New initramfs was not generated."
+
+note "Validating rebuilt initramfs"
+
+need file
+file "$CANDIDATE"
+
+lsinitrd -m "$CANDIDATE" |
+  grep '^rootfs-block$' >/dev/null ||
+  fail "Required rootfs-block module missing."
+
+note "Activating rebuilt initramfs"
+
+cp -a "$CANDIDATE" "$IMG.new.$TS"
+mv -f "$IMG.new.$TS" "$IMG"
+
+sync
+
+echo
+echo "Repair completed."
+echo "Updated: $IMG"
+echo "Original backup: $BACKUP"
+echo "Rebuilt image: $CANDIDATE"
+echo
+echo "The script will now unmount the recovery disk."
+echo "Verify all partitions are unmounted before EVS detachment."
+echo "Then reattach the disk to its original ECS as system disk."
+
